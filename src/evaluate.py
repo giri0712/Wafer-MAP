@@ -1,170 +1,166 @@
 """
-evaluate.py
-Full evaluation suite: confusion matrix, ROC curves,
-classification report, and top misclassified samples.
+evaluate.py — Cross-dataset robustness benchmark + explainability export
+======================================================================
+1. Ablation metrics per arm  (accuracy, macro-F1, per-class F1, minority recall)
+2. Cross-dataset matrix      (train WM-811K -> test MixedWM38 / sample, + reverse)
+3. Explainability grid       (Grad-CAM for CNN, attention rollout for ViT)
+
+Run:
+  python src/evaluate.py            # everything that has checkpoints/data
+  python src/evaluate.py --skip-explain
 """
 
 import os
+import sys
+import argparse
 import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
 import seaborn as sns
-from sklearn.metrics import (
-    confusion_matrix, classification_report,
-    roc_curve, auc
-)
-from sklearn.preprocessing import label_binarize
 import tensorflow as tf
+from sklearn.metrics import (confusion_matrix, classification_report,
+                             f1_score, recall_score)
 
-OUTPUT_DIR  = "outputs"
-MODEL_PATH  = "outputs/best_model.keras"
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from src.config import (
+    CLASS_NAMES, MODEL_VARIANTS, OUT_ROOT, MINORITY_CLASSES,
+)
+from src.explain import explain, explain_grid_figure
+from src.data import multi
 
-
-def load_artifacts():
-    model   = tf.keras.models.load_model(MODEL_PATH)
-    X_test  = np.load(f"{OUTPUT_DIR}/X_test.npy")
-    y_test  = np.load(f"{OUTPUT_DIR}/y_test.npy")
-    classes = np.load(f"{OUTPUT_DIR}/label_classes.npy", allow_pickle=True)
-    return model, X_test, y_test, classes
-
-
-# ── Confusion Matrix ──────────────────────────────────────────────────────────
-def plot_confusion_matrix(y_true, y_pred, classes):
-    cm = confusion_matrix(y_true, y_pred)
-    cm_norm = cm.astype(float) / cm.sum(axis=1, keepdims=True)
-
-    fig, axes = plt.subplots(1, 2, figsize=(18, 7))
-    fig.suptitle("Confusion Matrix — WaferMapCNN", fontsize=14, fontweight="bold")
-
-    for ax, data, fmt, title in zip(
-        axes,
-        [cm, cm_norm],
-        ["d", ".2f"],
-        ["Raw Counts", "Normalized (Recall)"]
-    ):
-        sns.heatmap(
-            data, annot=True, fmt=fmt, cmap="YlOrRd",
-            xticklabels=classes, yticklabels=classes,
-            linewidths=0.5, ax=ax
-        )
-        ax.set_title(title)
-        ax.set_xlabel("Predicted Label")
-        ax.set_ylabel("True Label")
-        ax.tick_params(axis="x", rotation=30)
-        ax.tick_params(axis="y", rotation=0)
-
-    plt.tight_layout()
-    path = f"{OUTPUT_DIR}/confusion_matrix.png"
-    plt.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close()
-    print(f"[INFO] Saved → {path}")
+MINORITY_IDX = [CLASS_NAMES.index(c) for c in MINORITY_CLASSES]
 
 
-# ── Classification Report ─────────────────────────────────────────────────────
-def save_classification_report(y_true, y_pred, classes):
-    report = classification_report(y_true, y_pred, target_names=classes)
-    print("\n" + "="*60)
-    print("Classification Report")
-    print("="*60)
-    print(report)
-    path = f"{OUTPUT_DIR}/classification_report.txt"
-    with open(path, "w") as f:
-        f.write("WaferMapCNN — Classification Report\n")
-        f.write("="*60 + "\n")
-        f.write(report)
-    print(f"[INFO] Saved → {path}")
+# ----------------------------------------------------------------------
+def load_arm(variant_key: str):
+    path = MODEL_VARIANTS[variant_key]["path"]
+    if not os.path.exists(path):
+        return None
+    return tf.keras.models.load_model(path, compile=False)
 
 
-# ── ROC Curves ────────────────────────────────────────────────────────────────
-def plot_roc_curves(y_test_cat, y_prob, classes):
-    n_classes = len(classes)
-    y_bin = y_test_cat  # already one-hot
-
-    colors = plt.cm.tab10(np.linspace(0, 1, n_classes))
-    fig, ax = plt.subplots(figsize=(10, 8))
-
-    for i, (cls, color) in enumerate(zip(classes, colors)):
-        fpr, tpr, _ = roc_curve(y_bin[:, i], y_prob[:, i])
-        roc_auc = auc(fpr, tpr)
-        ax.plot(fpr, tpr, color=color, lw=2, label=f"{cls} (AUC = {roc_auc:.3f})")
-
-    ax.plot([0, 1], [0, 1], "k--", lw=1, alpha=0.5)
-    ax.set_xlim([0.0, 1.0])
-    ax.set_ylim([0.0, 1.05])
-    ax.set_xlabel("False Positive Rate", fontsize=12)
-    ax.set_ylabel("True Positive Rate", fontsize=12)
-    ax.set_title("ROC Curves (One-vs-Rest) — WaferMapCNN", fontsize=14, fontweight="bold")
-    ax.legend(loc="lower right", fontsize=9)
-    ax.grid(alpha=0.3)
-
-    plt.tight_layout()
-    path = f"{OUTPUT_DIR}/roc_curves.png"
-    plt.savefig(path, dpi=150)
-    plt.close()
-    print(f"[INFO] Saved → {path}")
+def eval_on(model, X, y):
+    prob = model.predict(X, batch_size=128, verbose=0)
+    pred = prob.argmax(1)
+    return {
+        "acc": float((pred == y).mean()),
+        "macro_f1": float(f1_score(y, pred, average="macro",
+                                   labels=list(range(len(CLASS_NAMES))),
+                                   zero_division=0)),
+        "minority_recall": float(recall_score(
+            y, pred, labels=MINORITY_IDX, average="macro",
+            zero_division=0)) if len(y) else 0.0,
+        "per_class_f1": f1_score(y, pred, average=None,
+                                 labels=list(range(len(CLASS_NAMES))),
+                                 zero_division=0),
+        "y_pred": pred,
+    }
 
 
-# ── Top Misclassified ─────────────────────────────────────────────────────────
-def plot_top_misclassified(X_test, y_true, y_pred, y_prob, classes, top_n=12):
-    wrong_idx = np.where(y_true != y_pred)[0]
-    if len(wrong_idx) == 0:
-        print("[INFO] No misclassified samples found!")
-        return
-
-    # Sort by max confidence in wrong prediction (most confidently wrong first)
-    wrong_conf = y_prob[wrong_idx].max(axis=1)
-    sorted_idx = wrong_idx[np.argsort(wrong_conf)[::-1]][:top_n]
-
-    cols = 4
-    rows = (len(sorted_idx) + cols - 1) // cols
-    fig, axes = plt.subplots(rows, cols, figsize=(cols * 3.5, rows * 3.5))
-    fig.suptitle("Top Misclassified Wafer Maps (Most Confident Errors)",
-                 fontsize=13, fontweight="bold")
-    axes = axes.flatten()
-
-    for i, idx in enumerate(sorted_idx):
-        ax = axes[i]
-        ax.imshow(X_test[idx].squeeze(), cmap="RdYlGn", interpolation="nearest")
-        conf = y_prob[idx].max()
-        ax.set_title(
-            f"True: {classes[y_true[idx]]}\nPred: {classes[y_pred[idx]]} ({conf:.0%})",
-            fontsize=8, color="red"
-        )
-        ax.axis("off")
-
-    for j in range(i + 1, len(axes)):
-        axes[j].axis("off")
-
-    plt.tight_layout()
-    path = f"{OUTPUT_DIR}/top_misclassified.png"
-    plt.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close()
-    print(f"[INFO] Saved → {path}")
+def eval_split(X, y, tag, rows, rows_perclass, y_val_ref=None):
+    for vk, meta in MODEL_VARIANTS.items():
+        model = load_arm(vk)
+        if model is None:
+            continue
+        r = eval_on(model, X, y)
+        rows.append({
+            "variant": vk, "name": meta["name"], "split": tag,
+            "acc": r["acc"], "macro_f1": r["macro_f1"],
+            "minority_recall": r["minority_recall"],
+            "params": meta and model.count_params(),
+        })
+        rows_perclass.append({
+            "variant": meta["name"],
+            **{c: float(f) for c, f in zip(CLASS_NAMES, r["per_class_f1"])},
+        })
+        # save confusion data for the studio
+        cm = confusion_matrix(y, r["y_pred"], labels=list(range(len(CLASS_NAMES))))
+        np.save(os.path.join(OUT_ROOT, f"cm_{vk}_{tag}.npy"), cm)
+        print(f"  [{meta['name']}] {tag}: acc={r['acc']:.3f} "
+              f"macroF1={r['macro_f1']:.3f} minRecall={r['minority_recall']:.3f}")
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------------
 def main():
-    print("[INFO] Loading model and test data ...")
-    model, X_test, y_test, classes = load_artifacts()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--skip-explain", action="store_true")
+    ap.add_argument("--max-test", type=int, default=4000,
+                    help="cap per-dataset test size for speed")
+    args = ap.parse_args()
 
-    print("[INFO] Running inference on test set ...")
-    y_prob = model.predict(X_test, batch_size=64, verbose=1)
-    y_pred = y_prob.argmax(axis=1)
-    y_true = y_test.argmax(axis=1)
+    os.makedirs(OUT_ROOT, exist_ok=True)
+    os.makedirs(os.path.join(OUT_ROOT, "explain"), exist_ok=True)
 
-    test_acc = (y_pred == y_true).mean()
-    print(f"\n[RESULT] Test Accuracy: {test_acc*100:.2f}%\n")
+    rows, rows_pc = [], []
 
-    plot_confusion_matrix(y_true, y_pred, classes)
-    save_classification_report(y_true, y_pred, classes)
-    plot_roc_curves(y_test, y_prob, classes)
-    plot_top_misclassified(X_test, y_true, y_pred, y_prob, classes)
+    # ---------------- in-distribution (WM-811K val) ----------------
+    print("\n[1/3] WM-811K validation split …")
+    try:
+        _, _, X_val, y_val = multi.load_train_arrays("wm811k")
+        if args.max_test and len(X_val) > args.max_test:
+            X_val, y_val = X_val[: args.max_test], y_val[: args.max_test]
+        eval_split(X_val, y_val, "wm811k_val", rows, rows_pc)
+    except Exception as e:
+        print(f"[WARN] WM-811K eval skipped: {e}")
 
-    print(f"\n[DONE] All outputs saved to '{OUTPUT_DIR}/'")
-    print("  - confusion_matrix.png")
-    print("  - classification_report.txt")
-    print("  - roc_curves.png")
-    print("  - top_misclassified.png")
+    # ---------------- cross-dataset: MixedWM38 ----------------
+    print("\n[2/3] Cross-dataset: MixedWM38 (zero-shot) …")
+    try:
+        X38, y38 = multi.load_mixedwm38()
+        if args.max_test and len(X38) > args.max_test:
+            X38, y38 = X38[: args.max_test], y38[: args.max_test]
+        eval_split(X38, y38, "mixedwm38_zeroshot", rows, rows_pc)
+    except Exception as e:
+        print(f"[WARN] MixedWM38 eval skipped: {e}")
+
+    # ---------------- cross-dataset: sample-wafermap ----------------
+    print("\n[3/3] Cross-dataset: sample-wafermap (zero-shot) …")
+    try:
+        Xs, ys = multi.load_sample_wafermap()
+        if len(Xs) > args.max_test:
+            Xs, ys = Xs[: args.max_test], ys[: args.max_test]
+        eval_split(Xs, ys, "sample_zeroshot", rows, rows_pc)
+    except Exception as e:
+        print(f"[WARN] sample-wafermap eval skipped: {e}")
+
+    # ---------------- persist ----------------
+    if rows:
+        df = pd.DataFrame(rows)
+        df.to_csv(os.path.join(OUT_ROOT, "cross_dataset_results.csv"),
+                  index=False)
+        print(f"\n[INFO] Saved → outputs/cross_dataset_results.csv")
+        print(df.to_string(index=False))
+
+    if rows_pc:
+        df_pc = pd.DataFrame(rows_pc)
+        # keep the in-distribution rows for the per-class chart
+        df_pc = df_pc.loc[:, ~df_pc.columns.duplicated()]
+        df_pc.to_csv(os.path.join(OUT_ROOT, "per_class_f1.csv"), index=False)
+        print(f"[INFO] Saved → outputs/per_class_f1.csv")
+
+    # ---------------- explainability grids ----------------
+    if not args.skip_explain:
+        print("\n[EXPLAIN] Exporting explanation grids …")
+        for vk, meta in MODEL_VARIANTS.items():
+            model = load_arm(vk)
+            if model is None:
+                continue
+            try:
+                n = min(8, len(X_val))
+                sample_X = X_val[:n]
+                sample_y = [CLASS_NAMES[i] for i in y_val[:n]]
+                fig = explain_grid_figure(model, sample_X, sample_y, vk,
+                                          meta.get("layer"))
+                p = os.path.join(OUT_ROOT, "explain", f"grid_{vk}.png")
+                fig.savefig(p, dpi=130, bbox_inches="tight")
+                plt.close(fig)
+                print(f"[INFO] Saved → {p}")
+            except Exception as e:
+                print(f"[WARN] explain for {vk} failed: {e}")
+
+    print("\n[DONE] Evaluation complete.")
 
 
 if __name__ == "__main__":
